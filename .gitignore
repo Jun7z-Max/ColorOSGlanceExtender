@@ -1,0 +1,32 @@
+# Gradle / Android
+.gradle/
+**/build/
+local.properties
+captures/
+.externalNativeBuild/
+.cxx/
+
+# Release signing
+*.jks
+*.keystore
+keystore.properties
+.env
+.env.*
+
+# Generated artifacts
+dist/
+*.apk
+*.apks
+*.aab
+*.idsig
+
+# IDE
+.idea/
+*.iml
+
+# Operating systems
+.DS_Store
+Thumbs.db
+
+# Local release credentials
+.secrets/
