@@ -6,15 +6,16 @@ LSPosed 模块仓库的数据来自 `Xposed-Modules-Repo` GitHub 组织中的独
 
 | 项目 | 值 |
 |---|---|
+| 个人源码仓库 | `Jun7z-Max/ColorOSGlanceExtender` |
 | Android applicationId | `io.github.colorosglance.extender` |
-| LSPosed 仓库名 | `io.github.colorosglance.extender` |
+| LSPosed 官方仓库名 | `io.github.colorosglance.extender` |
 | 当前 versionCode | `12` |
 | 当前 versionName | `0.1.11` |
 | 当前 Release tag | `12-0.1.11` |
 
 applicationId 发布后应视为永久标识，不要随意修改，否则 LSPosed 会认为是另一个模块。
 
-模块使用中性 applicationId `io.github.colorosglance.extender`，不包含维护者个人标识。applicationId 是 Android 与 LSPosed 识别模块的稳定身份，正式发布后不再变更。
+个人源码仓库使用易读名称 `ColorOSGlanceExtender`；Android applicationId 和 LSPosed 官方仓库使用稳定标识 `io.github.colorosglance.extender`。两者用途不同，不需要同名。
 
 ## 首次提交
 
@@ -39,7 +40,7 @@ applicationId 发布后应视为永久标识，不要随意修改，否则 LSPos
 9. 设置仓库元数据：
    - Repository name：`io.github.colorosglance.extender`
    - Description：`ColorOS 负一屏扩展`
-   - Homepage：`https://github.com/Jun7z-Max` 或模块仓库的 Issue 页面
+   - Homepage：`https://github.com/Jun7z-Max/ColorOSGlanceExtender`
    - Collaborators：模块作者
 10. 确认根目录包含：
     - `SUMMARY`：仓库首页使用的短描述；
@@ -74,15 +75,14 @@ LSPosed 模块仓库要求 Release 使用以下结构：
 4. 创建新的 `<versionCode>-<versionName>` tag；
 5. 创建新的 Release 并同时上传 APK。
 
-## 转移已有仓库
+## 个人仓库与官方仓库
 
-如果已经在个人账号下创建并维护了同名仓库，可以在 submission 仓库创建：
+本项目采用 `[submission]` 流程：
 
-```text
-[transfer] io.github.colorosglance.extender
-```
-
-随后按机器人提示把仓库所有权转移到 `Xposed-Modules-Repo` 组织。转移前请确认默认分支、Actions Secrets、Release 和仓库权限配置均已备份。
+- 个人源码仓库保持易读名称 `Jun7z-Max/ColorOSGlanceExtender`；
+- 官方机器人创建 `Xposed-Modules-Repo/io.github.colorosglance.extender`；
+- 接受管理员邀请后，将源码、标签和 Release 同步到官方仓库；
+- 不需要把个人仓库改成 Android 包名，也不需要转移个人仓库所有权。
 
 ## 发布前检查
 

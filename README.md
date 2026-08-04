@@ -143,7 +143,7 @@ export CGE_KEY_PASSWORD='...'
 
 ## LSPosed 模块仓库
 
-首次提交包名 `io.github.colorosglance.extender` 后，官方机器人会创建对应的 `Xposed-Modules-Repo` 仓库并邀请维护者。正式 Release tag 必须使用 `<versionCode>-<versionName>`，当前版本为 `12-0.1.11`。完整步骤见 [`docs/lsposed-repository.md`](docs/lsposed-repository.md)。
+个人源码仓库为 `Jun7z-Max/ColorOSGlanceExtender`；Android 包名为 `io.github.colorosglance.extender`。首次提交后，官方机器人会另行创建以包名命名的 `Xposed-Modules-Repo` 仓库。正式 Release tag 必须使用 `<versionCode>-<versionName>`，当前版本为 `12-0.1.11`。完整步骤见 [`docs/lsposed-repository.md`](docs/lsposed-repository.md)。
 
 ## 项目结构
 
