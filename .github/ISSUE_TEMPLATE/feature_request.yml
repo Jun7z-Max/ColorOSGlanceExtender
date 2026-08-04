@@ -1,0 +1,27 @@
+name: Feature request
+description: 提议通用能力或兼容性改进
+title: "[Feature] "
+labels:
+  - enhancement
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: 使用场景
+      description: 说明现有行为为什么无法满足需求
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: 建议方案
+      description: 优先描述通用能力，不接受仅针对单个应用的硬编码白名单
+    validations:
+      required: true
+
+  - type: textarea
+    id: risks
+    attributes:
+      label: 风险与兼容性
+      description: 是否会写数据库、操作 AppWidget ID 或增加新的作用域

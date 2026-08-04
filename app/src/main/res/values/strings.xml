@@ -1,0 +1,9 @@
+<resources>
+    <string name="app_name">ColorOS 负一屏扩展</string>
+    <string name="module_description">将当前用户可用的标准 Android 桌面小组件动态接入 ColorOS 速览卡片中心</string>
+
+    <style name="AppTheme" parent="android:style/Theme.Material.Light.NoActionBar">
+        <item name="android:fontFamily">sans</item>
+        <item name="android:colorAccent">#426B5A</item>
+    </style>
+</resources>
