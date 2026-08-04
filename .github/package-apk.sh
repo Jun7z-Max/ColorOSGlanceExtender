@@ -3,7 +3,7 @@ set -eu
 
 usage() {
     cat <<'USAGE'
-Usage: ./scripts/package-apk.sh <debug|release> [--skip-build]
+Usage: ./.github/package-apk.sh <debug|release> [--skip-build]
 
 Release builds require:
   CGE_KEYSTORE_PATH

@@ -1,5 +1,5 @@
 plugins {
-    id("com.android.application")
+    id("com.android.application") version "9.1.1"
 }
 
 val releaseKeystorePath = providers.environmentVariable("CGE_KEYSTORE_PATH").orNull

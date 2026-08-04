@@ -82,25 +82,13 @@ Provider 只接受严格校验后的包名，只支持读取 PNG，不支持新�
 - Android Build Tools 36.0.0；
 - 可访问 Maven Central。
 
-基础检查：
+构建：
 
 ```bash
 ./gradlew clean lintDebug assembleDebug
 ```
 
-生成规范化调试产物：
-
-```bash
-./scripts/package-apk.sh debug
-```
-
-产物位于 `dist/`：
-
-```text
-ColorOS-Negative-Screen-Extension-v0.1.11-debug.apk
-ColorOS-Negative-Screen-Extension-v0.1.11-debug.apk.sha256
-SHA256SUMS
-```
+APK 输出到 `app/build/outputs/apk/debug/app-debug.apk`。
 
 
 ## 免责声明

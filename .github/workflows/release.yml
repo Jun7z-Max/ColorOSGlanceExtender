@@ -67,7 +67,7 @@ jobs:
           CGE_KEY_ALIAS: ${{ secrets.CGE_KEY_ALIAS }}
           CGE_KEY_PASSWORD: ${{ secrets.CGE_KEY_PASSWORD }}
           CGE_EXPECTED_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
-        run: ./scripts/package-apk.sh release
+        run: ./.github/package-apk.sh release
 
       - name: Publish GitHub Release
         env:
