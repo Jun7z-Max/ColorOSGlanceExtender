@@ -70,7 +70,7 @@ ColorOS 系统组件包含混淆类名，系统更新后 Hook 点可能变化。
 content://io.github.colorosglance.extender.icons/app/<packageName>
 ```
 
-Provider 只接受严格校验后的包名，只支持读取 PNG，不支持新增、更新或删除数据。详细说明见 [`PRIVACY.md`](PRIVACY.md)。
+Provider 只接受严格校验后的包名，只支持读取 PNG，不支持新增、更新或删除数据。
 
 
 ## 构建
