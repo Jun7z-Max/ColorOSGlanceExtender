@@ -1,9 +1,13 @@
 package io.github.colorosglance.extender;
 
+import android.annotation.SuppressLint;
 import android.appwidget.AppWidgetProviderInfo;
+import android.content.BroadcastReceiver;
 import android.content.ComponentName;
 import android.content.ContentProvider;
 import android.content.Context;
+import android.content.Intent;
+import android.content.IntentFilter;
 import android.net.Uri;
 import android.os.Binder;
 import android.os.Build;
@@ -13,6 +17,7 @@ import android.os.SystemClock;
 import android.os.UserHandle;
 import android.util.Log;
 
+import org.json.JSONArray;
 import org.json.JSONObject;
 
 import java.lang.ref.WeakReference;
@@ -20,7 +25,9 @@ import java.lang.reflect.Constructor;
 import java.lang.reflect.Executable;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
+import java.lang.reflect.Modifier;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashMap;
@@ -55,6 +62,7 @@ public final class GlanceObserver extends XposedModule {
     private static final int SYNTHETIC_GROUP_ORDER_BASE = 100_000;
     private static final int SYNTHETIC_PRIORITY = 999_999;
     private static final int MAX_SYNTHETIC_CONFIGS = 512;
+    private static final int MAX_RESIDENT_SCAN = 4096;
     private static final String ICON_PROVIDER_AUTHORITY =
             "io.github.colorosglance.extender.icons";
     private static final String ICON_PROVIDER_APP_PATH = "app";
@@ -93,8 +101,17 @@ public final class GlanceObserver extends XposedModule {
             new AtomicReference<>(new WeakReference<>(null));
     private final AtomicReference<List<AppWidgetProviderInfo>> latestProviderInfos =
             new AtomicReference<>(Collections.emptyList());
+    private final AtomicReference<WeakReference<Object>> configRepository =
+            new AtomicReference<>(new WeakReference<>(null));
+    private final AtomicBoolean refreshReceiverRegistered = new AtomicBoolean(false);
+    private final AtomicBoolean refreshInProgress = new AtomicBoolean(false);
+    private final AtomicLong lastCatalogPublish = new AtomicLong(0L);
+    private volatile Set<String> disabledCardIds = Collections.emptySet();
+    private volatile long disabledCardIdsReadAt;
+    private volatile BroadcastReceiver refreshReceiver;
     private volatile Constructor<?> operationWidgetConfigConstructor;
     private volatile Method operationWidgetToRawMethod;
+    private volatile ResidentLayout residentLayout;
     private volatile String loadedProcessName = "unknown";
 
     @Override
@@ -157,7 +174,6 @@ public final class GlanceObserver extends XposedModule {
             return;
         }
 
-        hookResidentServiceCapture(classLoader);
         hookResidentStateQuery(classLoader);
         info("速览 resident bridge Hook 安装完成");
     }
@@ -175,7 +191,6 @@ public final class GlanceObserver extends XposedModule {
                         false,
                         classLoader);
             } else {
-                Class.forName("FA.P", false, classLoader);
                 Class.forName(
                         "com.oplus.assistantscreen.card.store.provider."
                                 + "AssistantContentProvider",
@@ -186,31 +201,6 @@ public final class GlanceObserver extends XposedModule {
         } catch (Throwable ignored) {
             return false;
         }
-    }
-
-    private void hookResidentServiceCapture(ClassLoader classLoader) {
-        hookConstructorAfter(classLoader, "FA.P", new Class<?>[0], chain -> {
-            Object result = proceedUnchanged(chain, "resident-service-init", true);
-            Object service = chain.getThisObject();
-            subscriptionService.set(new WeakReference<>(service));
-            observeSafely("FA.P::<init>", () -> preflight(
-                    "resident service captured: " + summarizeResident(service)));
-            return result;
-        });
-
-        Class<?> fromClass = findClass(classLoader, "com.oplus.card.display.domain.From");
-        if (fromClass == null) {
-            return;
-        }
-        hookMethod(classLoader, "FA.P", "x",
-                new Class<?>[]{fromClass, String.class}, chain -> {
-                    Object result = proceedUnchanged(chain, "resident-service-refresh", true);
-                    Object service = chain.getThisObject();
-                    subscriptionService.set(new WeakReference<>(service));
-                    observeSafely("FA.P#x", () -> preflight(
-                            "resident service refreshed: " + summarizeResident(service)));
-                    return result;
-                });
     }
 
     private void hookResidentStateQuery(ClassLoader classLoader) {
@@ -229,27 +219,65 @@ public final class GlanceObserver extends XposedModule {
                         return result;
                     }
 
-                    Object service = subscriptionService.get().get();
+                    Object service = captureResidentService(chain.getThisObject());
                     Object returnedResult = umsCaller
                             ? addResidentBridgeState(result, service)
                             : result;
                     observeSafely("AssistantContentProvider#queryAddCardState", () -> preflight(
                             "resident bridge: callerUid=" + callingUid
                                     + ", umsCaller=" + umsCaller
+                                    + ", service=" + summarizeResident(service)
                                     + ", request=" + summarizeResidentBridgeRequest(request)
                                     + ", returned=" + summarizeResidentBridge(returnedResult)));
                     return returnedResult;
                 });
     }
 
+    private Object captureResidentService(Object provider) {
+        Object service = null;
+        try {
+            service = invokeNoArg(provider, "getCardSubscriptionService");
+        } catch (Throwable ignored) {
+            try {
+                for (Method method : provider.getClass().getMethods()) {
+                    if (method.getParameterTypes().length != 0
+                            || method.getReturnType() == Void.TYPE) {
+                        continue;
+                    }
+                    String methodName = method.getName();
+                    String returnType = method.getReturnType().getName();
+                    if (!methodName.contains("Subscription")
+                            && !returnType.contains("CardFacade")
+                            && !returnType.contains("CardSubscription")) {
+                        continue;
+                    }
+                    method.setAccessible(true);
+                    service = method.invoke(provider);
+                    if (service != null) {
+                        break;
+                    }
+                }
+            } catch (Throwable ignoredFallback) {
+            }
+        }
+        if (service != null) {
+            subscriptionService.set(new WeakReference<>(service));
+            return service;
+        }
+        return subscriptionService.get().get();
+    }
+
     private void hookUmsInjection(ClassLoader classLoader) {
         String providerRepository =
                 "com.oplus.ums.card.configuration.widget.repository.e";
-        String configRepository =
+        String configRepositoryClass =
                 "com.oplus.ums.card.configuration.widget.repository."
                         + "OperationWidgetConfigRepository";
 
+        registerRefreshReceiver();
+
         hookMethod(classLoader, providerRepository, "a", new Class<?>[0], chain -> {
+            registerRefreshReceiver();
             Object result = proceedUnchanged(chain, "ums-provider-snapshot", true);
             observeSafely("UMS provider snapshot", () -> {
                 List<AppWidgetProviderInfo> snapshot = snapshotProviderInfos(result);
@@ -259,7 +287,9 @@ public final class GlanceObserver extends XposedModule {
             return result;
         });
 
-        hookMethod(classLoader, configRepository, "c", new Class<?>[]{List.class}, chain -> {
+        hookMethod(classLoader, configRepositoryClass, "c", new Class<?>[]{List.class}, chain -> {
+            registerRefreshReceiver();
+            configRepository.set(new WeakReference<>(chain.getThisObject()));
             Object input = chain.getArg(0);
             long started = SystemClock.elapsedRealtime();
             SyntheticTrigger trigger = prepareSyntheticTrigger(
@@ -274,6 +304,7 @@ public final class GlanceObserver extends XposedModule {
                             "ums-config-repository-update",
                             new Object[]{effectiveInput},
                             true);
+            publishRepositoryCatalog(chain.getThisObject());
             observeSafely("UMS config repository update", () -> preflight(
                     "OperationWidgetConfigRepository#c: durationMs="
                             + (SystemClock.elapsedRealtime() - started)
@@ -283,14 +314,19 @@ public final class GlanceObserver extends XposedModule {
             return result;
         });
 
-        hookMethod(classLoader, configRepository, "d", new Class<?>[]{boolean.class}, chain -> {
+        hookMethod(classLoader, configRepositoryClass, "d", new Class<?>[]{boolean.class}, chain -> {
+            registerRefreshReceiver();
             Object repository = chain.getThisObject();
+            configRepository.set(new WeakReference<>(repository));
             synchronized (repository) {
                 long started = SystemClock.elapsedRealtime();
                 SyntheticInjection injection = prepareSyntheticInjection(
                         classLoader, repository, latestProviderInfos.get());
+                DisabledConfigRemoval disabledRemoval =
+                        prepareDisabledConfigRemoval(repository);
                 try {
                     Object result = proceedUnchanged(chain, "ums-config-rebuild", true);
+                    publishRepositoryCatalog(repository);
                     observeSafely("UMS config rebuild", () -> preflight(
                             "OperationWidgetConfigRepository#d: durationMs="
                                     + (SystemClock.elapsedRealtime() - started)
@@ -301,6 +337,7 @@ public final class GlanceObserver extends XposedModule {
                     return result;
                 } finally {
                     cleanupSyntheticInjection(repository, injection);
+                    restoreDisabledConfigRemoval(repository, disabledRemoval);
                 }
             }
         });
@@ -400,6 +437,130 @@ public final class GlanceObserver extends XposedModule {
         }
     }
 
+    @SuppressWarnings({"rawtypes", "unchecked"})
+    private DisabledConfigRemoval prepareDisabledConfigRemoval(Object repository) {
+        Set<String> disabled = readDisabledCardIds();
+        if (disabled.isEmpty()) {
+            return DisabledConfigRemoval.none();
+        }
+        try {
+            Object source = readField(repository, "g");
+            if (!(source instanceof List<?>)) {
+                return DisabledConfigRemoval.none();
+            }
+            List sourceList = (List) source;
+            ArrayList<RemovedConfig> removed = new ArrayList<>();
+            for (int index = sourceList.size() - 1; index >= 0; index--) {
+                Object item = sourceList.get(index);
+                if (isSyntheticConfig(item)) {
+                    continue;
+                }
+                String identity = cardIdentity(item);
+                if (!identity.isEmpty() && disabled.contains(identity)) {
+                    removed.add(new RemovedConfig(index, item));
+                    sourceList.remove(index);
+                }
+            }
+            if (removed.isEmpty()) {
+                return DisabledConfigRemoval.none();
+            }
+            Collections.sort(removed, Comparator.comparingInt(value -> value.index));
+            preflight("UMS disabled card filter: removed=" + removed.size());
+            return new DisabledConfigRemoval(removed);
+        } catch (Throwable throwable) {
+            error("UMS disabled card filter failed; keep original config", throwable);
+            return DisabledConfigRemoval.none();
+        }
+    }
+
+    @SuppressWarnings({"rawtypes", "unchecked"})
+    private void restoreDisabledConfigRemoval(
+            Object repository,
+            DisabledConfigRemoval removal) {
+        if (removal.removed.isEmpty()) {
+            return;
+        }
+        try {
+            Object source = readField(repository, "g");
+            if (!(source instanceof List<?>)) {
+                return;
+            }
+            List sourceList = (List) source;
+            for (RemovedConfig entry : removal.removed) {
+                if (sourceList.contains(entry.value)) {
+                    continue;
+                }
+                int targetIndex = Math.min(entry.index, sourceList.size());
+                sourceList.add(targetIndex, entry.value);
+            }
+            preflight("UMS disabled card restore: restored=" + removal.removed.size());
+        } catch (Throwable throwable) {
+            error("UMS disabled card restore failed", throwable);
+        }
+    }
+
+    private Set<String> readDisabledCardIds() {
+        long now = SystemClock.elapsedRealtime();
+        if (now - disabledCardIdsReadAt < 500L) {
+            return disabledCardIds;
+        }
+        Context context = findApplicationContext();
+        if (context == null) {
+            return disabledCardIds;
+        }
+        try {
+            Bundle result = context.getContentResolver().call(
+                    ModuleBridge.CONTROL_URI,
+                    ModuleBridge.METHOD_GET_DISABLED,
+                    null,
+                    null);
+            ArrayList<String> values = result == null
+                    ? null
+                    : result.getStringArrayList(ModuleBridge.KEY_DISABLED_IDS);
+            if (values == null) {
+                return disabledCardIds;
+            }
+            HashSet<String> copy = new HashSet<>();
+            for (String value : values) {
+                if (value != null && !value.isEmpty() && value.length() <= 512) {
+                    copy.add(value);
+                }
+            }
+            disabledCardIds = Collections.unmodifiableSet(copy);
+            disabledCardIdsReadAt = now;
+            return disabledCardIds;
+        } catch (Throwable throwable) {
+            error("读取卡片启用状态失败；沿用最近一次状态", throwable);
+            return disabledCardIds;
+        }
+    }
+
+    private static String cardIdentity(Object config) {
+        try {
+            String extras = asString(invokeNoArg(config, "getExtras"));
+            if (extras != null && !extras.isEmpty()) {
+                JSONObject marker = new JSONObject(extras);
+                String markedComponent = marker.optString(MARKER_COMPONENT_KEY, "");
+                if (!markedComponent.isEmpty()) {
+                    return markedComponent;
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        try {
+            String packageName = asString(invokeNoArg(config, "getPackageName"));
+            String componentName = asString(invokeNoArg(config, "getComponentName"));
+            if (packageName != null && !packageName.isEmpty()
+                    && componentName != null && !componentName.isEmpty()) {
+                return providerComponentKey(packageName, componentName);
+            }
+            Integer type = asInteger(invokeNoArg(config, "getType"));
+            return type == null ? "" : "type:" + type;
+        } catch (Throwable ignored) {
+            return "";
+        }
+    }
+
     private SyntheticBuild buildSyntheticConfigs(
             ClassLoader classLoader,
             Object existingConfigValue,
@@ -420,6 +581,7 @@ public final class GlanceObserver extends XposedModule {
         List<AppWidgetProviderInfo> providers = providerValue == null
                 ? Collections.emptyList()
                 : providerValue;
+        Set<String> disabled = readDisabledCardIds();
         ArrayList<AppWidgetProviderInfo> sortedProviders = new ArrayList<>(providers);
         sortedProviders.sort(Comparator.comparing(GlanceObserver::providerComponentKey));
 
@@ -491,6 +653,7 @@ public final class GlanceObserver extends XposedModule {
         int foreignProfileSkipped = 0;
         int nonHomeSkipped = 0;
         int configuredSkipped = 0;
+        int disabledSkipped = 0;
         int duplicateSkipped = 0;
         int malformedProvider = 0;
         for (AppWidgetProviderInfo info : sortedProviders) {
@@ -517,6 +680,10 @@ public final class GlanceObserver extends XposedModule {
                 }
                 if (configuredComponents.contains(componentKey)) {
                     configuredSkipped++;
+                    continue;
+                }
+                if (disabled.contains(componentKey)) {
+                    disabledSkipped++;
                     continue;
                 }
                 candidates.add(info);
@@ -638,6 +805,7 @@ public final class GlanceObserver extends XposedModule {
                         + localTitlePackages.size() + "/" + missingTitlePackages.size()
                         + ", sizes=" + sizeOne + '/' + sizeTwo + '/' + sizeThree
                         + ", configuredSkipped=" + configuredSkipped
+                        + ", disabledSkipped=" + disabledSkipped
                         + ", foreignProfileSkipped=" + foreignProfileSkipped
                         + ", nonHomeSkipped=" + nonHomeSkipped
                         + ", duplicateSkipped=" + duplicateSkipped
@@ -646,6 +814,451 @@ public final class GlanceObserver extends XposedModule {
                         + ", typeCollisionSkipped=" + typeCollisionSkipped
                         + ", constructorFailures=" + constructorFailures
                         + ", bridge={" + bridgeSummary + "}");
+    }
+
+    @SuppressLint("UnspecifiedRegisterReceiverFlag")
+    private void registerRefreshReceiver() {
+        if (!refreshReceiverRegistered.compareAndSet(false, true)) {
+            return;
+        }
+        Context context = findApplicationContext();
+        if (context == null) {
+            refreshReceiverRegistered.set(false);
+            return;
+        }
+        BroadcastReceiver receiver = new BroadcastReceiver() {
+            @Override
+            public void onReceive(Context ignoredContext, Intent ignoredIntent) {
+                refreshUmsRepository();
+            }
+        };
+        try {
+            IntentFilter filter = new IntentFilter(ModuleBridge.ACTION_REFRESH);
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                context.registerReceiver(receiver, filter, Context.RECEIVER_EXPORTED);
+            } else {
+                context.registerReceiver(receiver, filter);
+            }
+            refreshReceiver = receiver;
+            info("UMS 卡片刷新广播已注册");
+        } catch (Throwable throwable) {
+            refreshReceiverRegistered.set(false);
+            error("UMS 卡片刷新广播注册失败", throwable);
+        }
+    }
+
+    private void refreshUmsRepository() {
+        if (!refreshInProgress.compareAndSet(false, true)) {
+            return;
+        }
+        try {
+            disabledCardIdsReadAt = 0L;
+            Object repository = configRepository.get().get();
+            if (repository == null) {
+                info("收到卡片刷新请求，但 UMS 配置仓库尚未就绪");
+                return;
+            }
+            refreshProviderSnapshot(repository);
+            Method rebuild = findBooleanMethod(repository, "d");
+            if (rebuild == null) {
+                info("收到卡片刷新请求，但未找到 UMS 重建入口");
+                return;
+            }
+            rebuild.invoke(repository, true);
+            preflight("UMS 主动卡片刷新完成");
+        } catch (Throwable throwable) {
+            error("UMS 主动卡片刷新失败；保持宿主原有行为", throwable);
+        } finally {
+            refreshInProgress.set(false);
+        }
+    }
+
+    private void refreshProviderSnapshot(Object repository) {
+        try {
+            Object providerLazy = readField(repository, "d");
+            Object providerRepository = invokeNoArg(providerLazy, "getValue");
+            List<AppWidgetProviderInfo> current = snapshotProviderInfos(
+                    invokeNoArg(providerRepository, "a"));
+            if (!current.isEmpty()) {
+                latestProviderInfos.set(current);
+            }
+        } catch (Throwable throwable) {
+            error("主动刷新 Provider 快照失败；沿用最近一次快照", throwable);
+        }
+    }
+
+    private static Method findBooleanMethod(Object owner, String methodName) {
+        if (owner == null) {
+            return null;
+        }
+        Class<?> type = owner.getClass();
+        while (type != null && type != Object.class) {
+            for (Method method : type.getDeclaredMethods()) {
+                Class<?>[] parameters = method.getParameterTypes();
+                if (!methodName.equals(method.getName())
+                        || parameters.length != 1
+                        || (parameters[0] != boolean.class && parameters[0] != Boolean.class)) {
+                    continue;
+                }
+                try {
+                    method.setAccessible(true);
+                    return method;
+                } catch (Throwable ignored) {
+                }
+            }
+            type = type.getSuperclass();
+        }
+        return null;
+    }
+
+    private void publishCatalogSnapshot(
+            Object existingConfigValue,
+            List<AppWidgetProviderInfo> providers,
+            Set<String> configuredComponents) {
+        long now = SystemClock.elapsedRealtime();
+        if (now - lastCatalogPublish.get() < 750L
+                || !(existingConfigValue instanceof Iterable<?>)) {
+            return;
+        }
+        lastCatalogPublish.set(now);
+        try {
+            JSONArray cards = new JSONArray();
+            HashSet<String> ids = new HashSet<>();
+            int index = 0;
+            for (Object item : (Iterable<?>) existingConfigValue) {
+                JSONObject card = catalogCardFromConfig(item, index++);
+                if (card == null) {
+                    continue;
+                }
+                String id = card.optString("id", "");
+                if (!id.isEmpty() && ids.add(id)) {
+                    cards.put(card);
+                }
+            }
+            if (providers != null) {
+                for (AppWidgetProviderInfo info : providers) {
+                    if (!isEligibleProvider(info)) {
+                        continue;
+                    }
+                    String componentKey = providerComponentKey(info);
+                    if (configuredComponents != null
+                            && configuredComponents.contains(componentKey)) {
+                        continue;
+                    }
+                    JSONObject card = catalogCardFromProvider(info);
+                    if (card == null) {
+                        continue;
+                    }
+                    String id = card.optString("id", "");
+                    if (!id.isEmpty() && ids.add(id)) {
+                        cards.put(card);
+                    }
+                }
+            }
+            JSONObject catalog = new JSONObject();
+            catalog.put("version", 1);
+            catalog.put("updatedAt", System.currentTimeMillis());
+            catalog.put("cards", cards);
+            Context context = findApplicationContext();
+            if (context == null) {
+                return;
+            }
+            Bundle extras = new Bundle();
+            extras.putString(ModuleBridge.KEY_CATALOG, catalog.toString());
+            context.getContentResolver().call(
+                    ModuleBridge.CONTROL_URI,
+                    ModuleBridge.METHOD_PUBLISH_CATALOG,
+                    null,
+                    extras);
+            preflight("第三方卡片目录发布：total=" + cards.length());
+        } catch (Throwable throwable) {
+            error("发布卡片目录失败；不影响宿主配置", throwable);
+        }
+    }
+
+    private void publishRepositoryCatalog(Object repository) {
+        try {
+            Object cloudConfigs = readField(repository, "g");
+            Object matchedConfigs = readField(repository, "h");
+            Object catalogConfigs = matchCatalogConfigs(cloudConfigs, matchedConfigs);
+            if (!(catalogConfigs instanceof Iterable<?>)) {
+                return;
+            }
+            publishCatalogSnapshot(
+                    catalogConfigs,
+                    latestProviderInfos.get(),
+                    configuredComponentsFrom(catalogConfigs));
+        } catch (Throwable throwable) {
+            error("读取 UMS 最终卡片目录失败；沿用已有目录", throwable);
+        }
+    }
+
+    private static Object matchCatalogConfigs(Object cloudConfigs, Object matchedConfigs) {
+        if (!(cloudConfigs instanceof Iterable<?>)) {
+            return matchedConfigs;
+        }
+        if (!(matchedConfigs instanceof Iterable<?>)) {
+            return cloudConfigs;
+        }
+        HashSet<String> matchedKeys = new HashSet<>();
+        for (Object item : (Iterable<?>) matchedConfigs) {
+            addCardIdentityKeys(matchedKeys, item);
+        }
+        if (matchedKeys.isEmpty()) {
+            return cloudConfigs;
+        }
+        ArrayList<Object> filtered = new ArrayList<>();
+        for (Object item : (Iterable<?>) cloudConfigs) {
+            if (hasCardIdentityKey(item, matchedKeys)) {
+                filtered.add(item);
+            }
+        }
+        return filtered.isEmpty() ? cloudConfigs : filtered;
+    }
+
+    private static boolean hasCardIdentityKey(Object config, Set<String> expected) {
+        HashSet<String> keys = new HashSet<>();
+        addCardIdentityKeys(keys, config);
+        for (String key : keys) {
+            if (expected.contains(key)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static void addCardIdentityKeys(Set<String> target, Object config) {
+        if (target == null || config == null) {
+            return;
+        }
+        try {
+            String extras = asString(invokeNoArg(config, "getExtras"));
+            if (extras != null && !extras.isEmpty()) {
+                try {
+                    String component = new JSONObject(extras)
+                            .optString(MARKER_COMPONENT_KEY, "");
+                    if (!component.isEmpty()) {
+                        target.add("component:" + component);
+                    }
+                } catch (Throwable ignored) {
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        try {
+            String packageName = asString(invokeNoArg(config, "getPackageName"));
+            String componentName = asString(invokeNoArg(config, "getComponentName"));
+            if (packageName != null && !packageName.isEmpty()
+                    && componentName != null && !componentName.isEmpty()) {
+                target.add("component:" + providerComponentKey(packageName, componentName));
+            }
+        } catch (Throwable ignored) {
+        }
+        try {
+            Integer type = asInteger(invokeNoArg(config, "getType"));
+            if (type != null) {
+                target.add("type:" + type);
+            }
+        } catch (Throwable ignored) {
+        }
+    }
+
+    private static Set<String> configuredComponentsFrom(Object value) {
+        HashSet<String> components = new HashSet<>();
+        if (!(value instanceof Iterable<?>)) {
+            return components;
+        }
+        for (Object item : (Iterable<?>) value) {
+            try {
+                String packageName = asString(invokeNoArg(item, "getPackageName"));
+                String componentName = asString(invokeNoArg(item, "getComponentName"));
+                if (packageName != null && !packageName.isEmpty()
+                        && componentName != null && !componentName.isEmpty()) {
+                    components.add(providerComponentKey(packageName, componentName));
+                }
+            } catch (Throwable ignored) {
+            }
+        }
+        return components;
+    }
+
+    private JSONObject catalogCardFromConfig(Object item, int fallbackIndex) {
+        try {
+            Integer type = asInteger(invokeNoArg(item, "getType"));
+            String packageName = asString(invokeNoArg(item, "getPackageName"));
+            String componentName = asString(invokeNoArg(item, "getComponentName"));
+            String groupTitle = asString(invokeNoArg(item, "getGroupTitle"));
+            String groupIcon = asString(invokeNoArg(item, "getGroupIcon"));
+            String extras = "";
+            try {
+                String value = asString(invokeNoArg(item, "getExtras"));
+                if (value != null) {
+                    extras = value;
+                }
+            } catch (Throwable ignored) {
+            }
+            boolean synthetic = isSyntheticConfig(item);
+            if (!synthetic) {
+                return null;
+            }
+            String markedComponent = "";
+            if (extras != null && !extras.isEmpty()) {
+                try {
+                    markedComponent = new JSONObject(extras)
+                            .optString(MARKER_COMPONENT_KEY, "");
+                } catch (Throwable ignored) {
+                }
+            }
+            String id = !markedComponent.isEmpty()
+                    ? markedComponent
+                    : packageName != null && !packageName.isEmpty()
+                    && componentName != null && !componentName.isEmpty()
+                    ? providerComponentKey(packageName, componentName)
+                    : type == null
+                    ? "third-party:" + fallbackIndex
+                    : "type:" + type;
+            String title = firstNonEmptyString(
+                    item,
+                    "getWidgetName",
+                    "getCardName",
+                    "getName",
+                    "getTitle");
+            if (title.isEmpty()) {
+                title = componentTail(componentName, type == null ? "卡片" : "卡片 " + type);
+            }
+            String appLabel = groupTitle == null ? "" : groupTitle.trim();
+            if (appLabel.isEmpty()) {
+                appLabel = resolvePackageLabel(packageName);
+            }
+            if (appLabel.isEmpty()) {
+                appLabel = packageName == null || packageName.isEmpty()
+                        ? "第三方应用"
+                        : packageName;
+            }
+            String icon = groupIcon == null ? "" : groupIcon.trim();
+            if (icon.isEmpty() && packageName != null && !packageName.isEmpty()) {
+                icon = iconUriForPackage(packageName);
+            }
+            JSONObject result = new JSONObject();
+            result.put("id", id);
+            result.put("packageName", packageName == null ? "" : packageName);
+            result.put("componentName", componentName == null ? "" : componentName);
+            result.put("appLabel", appLabel);
+            result.put("title", title);
+            result.put("subtitle", componentTail(componentName, "桌面小组件"));
+            result.put("icon", icon);
+            result.put("synthetic", true);
+            if (type != null) {
+                result.put("type", type);
+            }
+            return result;
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+
+    private JSONObject catalogCardFromProvider(AppWidgetProviderInfo info) {
+        if (info == null || info.provider == null) {
+            return null;
+        }
+        try {
+            ComponentName provider = info.provider;
+            String packageName = provider.getPackageName();
+            String componentName = provider.getClassName();
+            String title = "";
+            Context context = findApplicationContext();
+            if (context != null) {
+                try {
+                    CharSequence label = info.loadLabel(context.getPackageManager());
+                    title = label == null ? "" : label.toString().trim();
+                } catch (Throwable ignored) {
+                }
+            }
+            if (title.isEmpty()) {
+                title = componentTail(componentName, "桌面小组件");
+            }
+            String appLabel = resolvePackageLabel(packageName);
+            JSONObject result = new JSONObject();
+            result.put("id", providerComponentKey(info));
+            result.put("packageName", packageName);
+            result.put("componentName", componentName);
+            result.put("appLabel", appLabel.isEmpty() ? packageName : appLabel);
+            result.put("title", title);
+            result.put("subtitle", componentTail(componentName, "桌面小组件"));
+            result.put("icon", iconUriForPackage(packageName));
+            result.put("synthetic", true);
+            result.put("size", classifyWidgetSize(info));
+            return result;
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+
+    private String resolvePackageLabel(String packageName) {
+        if (packageName == null || packageName.isEmpty()) {
+            return "";
+        }
+        Context context = findApplicationContext();
+        if (context == null) {
+            return "";
+        }
+        try {
+            android.content.pm.ApplicationInfo info = context.getPackageManager()
+                    .getApplicationInfo(packageName, 0);
+            CharSequence label = context.getPackageManager().getApplicationLabel(info);
+            return label == null ? "" : label.toString().trim();
+        } catch (Throwable ignored) {
+            return "";
+        }
+    }
+
+    private static String firstNonEmptyString(Object owner, String... methodNames) {
+        for (String methodName : methodNames) {
+            try {
+                String value = asString(invokeNoArg(owner, methodName));
+                if (value != null && !value.trim().isEmpty()) {
+                    return value.trim();
+                }
+            } catch (Throwable ignored) {
+            }
+        }
+        return "";
+    }
+
+    private static String componentTail(String componentName, String fallback) {
+        if (componentName == null || componentName.isEmpty()) {
+            return fallback;
+        }
+        int separator = componentName.lastIndexOf('.');
+        String tail = separator >= 0 && separator + 1 < componentName.length()
+                ? componentName.substring(separator + 1)
+                : componentName;
+        return tail.isEmpty() ? fallback : tail;
+    }
+
+    private static String iconUriForPackage(String packageName) {
+        return new Uri.Builder()
+                .scheme("content")
+                .authority(ICON_PROVIDER_AUTHORITY)
+                .appendPath(ICON_PROVIDER_APP_PATH)
+                .appendPath(packageName)
+                .build()
+                .toString();
+    }
+
+    private static boolean isEligibleProvider(AppWidgetProviderInfo info) {
+        if (info == null || info.provider == null) {
+            return false;
+        }
+        try {
+            UserHandle profile = info.getProfile();
+            return (profile == null || Process.myUserHandle().equals(profile))
+                    && (info.widgetCategory == 0
+                    || (info.widgetCategory
+                    & AppWidgetProviderInfo.WIDGET_CATEGORY_HOME_SCREEN) != 0);
+        } catch (Throwable ignored) {
+            return false;
+        }
     }
 
     private List<AppWidgetProviderInfo> resolveProviderInfos(
@@ -966,6 +1579,28 @@ public final class GlanceObserver extends XposedModule {
         }
     }
 
+    private static final class DisabledConfigRemoval {
+        final List<RemovedConfig> removed;
+
+        DisabledConfigRemoval(List<RemovedConfig> removed) {
+            this.removed = removed;
+        }
+
+        static DisabledConfigRemoval none() {
+            return new DisabledConfigRemoval(Collections.emptyList());
+        }
+    }
+
+    private static final class RemovedConfig {
+        final int index;
+        final Object value;
+
+        RemovedConfig(int index, Object value) {
+            this.index = index;
+            this.value = value;
+        }
+    }
+
     private Context findApplicationContext() {
         Object application = invokeStaticNoArgSafely(
                 "android.app.ActivityThread", "currentApplication");
@@ -1047,25 +1682,6 @@ public final class GlanceObserver extends XposedModule {
         }
     }
 
-    private void hookConstructorAfter(
-            ClassLoader classLoader,
-            String className,
-            Class<?>[] parameterTypes,
-            XposedInterface.Hooker hooker) {
-        Class<?> owner = findClass(classLoader, className);
-        if (owner == null) {
-            return;
-        }
-        try {
-            Constructor<?> constructor = owner.getDeclaredConstructor(parameterTypes);
-            constructor.setAccessible(true);
-            hook(constructor).setId("cge-" + className + "-init").intercept(hooker);
-            info("Hook 已安装：" + signature(constructor));
-        } catch (Throwable throwable) {
-            error("Hook 安装失败：" + className + "::<init>", throwable);
-        }
-    }
-
     private Class<?> findClass(ClassLoader classLoader, String className) {
         try {
             return Class.forName(className, false, classLoader);
@@ -1076,26 +1692,19 @@ public final class GlanceObserver extends XposedModule {
     }
 
     private String summarizeResident(Object service) {
-        if (service == null) {
-            return "ready=unknown, size=unknown, controlType=unknown";
+        ResidentSnapshot snapshot = readResidentSnapshot(service);
+        if (!snapshot.known) {
+            return "ready=unknown, size=unknown, controlType=unknown, structureMismatch=true";
         }
-        try {
-            Object readyValue = readField(service, "j");
-            Object residentValue = readField(service, "g");
-            if (!(readyValue instanceof Boolean) || !(residentValue instanceof Iterable<?>)) {
-                return "ready=unknown, size=unknown, controlType=unknown, structureMismatch=true";
-            }
-
-            ResidentState state = inspectResidentState((Iterable<?>) residentValue);
-            return "ready=" + readyValue
-                    + ", size=" + state.size
-                    + ", controlType=" + state.controlType
-                    + ", nullProvider=" + state.nullProvider
-                    + ", componentProvider=" + state.componentProvider
-                    + ", malformed=" + state.malformed;
-        } catch (Throwable ignored) {
-            return "ready=unknown, size=unknown, controlType=unknown, readError=true";
-        }
+        ResidentState state = snapshot.state;
+        return "ready=" + snapshot.ready
+                + ", size=" + state.size
+                + ", recognized=" + state.recognized
+                + ", controlType=" + state.controlType
+                + ", nullProvider=" + state.nullProvider
+                + ", componentProvider=" + state.componentProvider
+                + ", malformed=" + state.malformed
+                + ", layout=" + snapshot.layoutSummary;
     }
 
     private String summarizeRawConfigs(Object value) {
@@ -1164,6 +1773,108 @@ public final class GlanceObserver extends XposedModule {
         }
     }
 
+    private ResidentSnapshot readResidentSnapshot(Object service) {
+        if (service == null) {
+            return ResidentSnapshot.unknown();
+        }
+        ResidentLayout layout = residentLayout;
+        if (layout == null || !layout.matches(service)) {
+            layout = discoverResidentLayout(service);
+            if (layout == null) {
+                return ResidentSnapshot.unknown();
+            }
+            residentLayout = layout;
+        }
+        try {
+            Object value = layout.residentField.get(service);
+            if (!(value instanceof Iterable<?>)) {
+                return ResidentSnapshot.unknown();
+            }
+            ResidentState state = inspectResidentState((Iterable<?>) value);
+            Boolean readyValue = layout.readReady(service);
+            boolean ready = readyValue != null
+                    ? readyValue
+                    : state.recognized > 0 && state.malformed == 0;
+            return new ResidentSnapshot(true, ready, state, layout.summary());
+        } catch (Throwable ignored) {
+            return ResidentSnapshot.unknown();
+        }
+    }
+
+    private static ResidentLayout discoverResidentLayout(Object service) {
+        List<Field> fields = instanceFields(service.getClass());
+        ResidentFieldCandidate best = null;
+        for (int index = 0; index < fields.size(); index++) {
+            Field field = fields.get(index);
+            if (!Iterable.class.isAssignableFrom(field.getType())) {
+                continue;
+            }
+            try {
+                Object value = field.get(service);
+                if (!(value instanceof Iterable<?>)) {
+                    continue;
+                }
+                ResidentState state = inspectResidentState((Iterable<?>) value);
+                int score = state.recognized * 1000
+                        - state.malformed * 100
+                        + Math.min(state.size, 99);
+                if (String.valueOf(field.getGenericType()).contains("CardDisplay")) {
+                    score += 250;
+                }
+                if (best == null || score > best.score) {
+                    best = new ResidentFieldCandidate(field, index, state, score);
+                }
+            } catch (Throwable ignored) {
+            }
+        }
+        if (best == null || best.state.recognized == 0) {
+            return null;
+        }
+        Field readyField = chooseReadyField(fields, best.fieldIndex);
+        return new ResidentLayout(service.getClass(), best.field, readyField);
+    }
+
+    private static Field chooseReadyField(List<Field> fields, int residentFieldIndex) {
+        Field nearestAfter = null;
+        Field nearest = null;
+        int nearestDistance = Integer.MAX_VALUE;
+        for (int index = 0; index < fields.size(); index++) {
+            Field field = fields.get(index);
+            Class<?> fieldType = field.getType();
+            if (fieldType != boolean.class && fieldType != Boolean.class) {
+                continue;
+            }
+            int distance = Math.abs(index - residentFieldIndex);
+            if (distance < nearestDistance) {
+                nearest = field;
+                nearestDistance = distance;
+            }
+            if (index > residentFieldIndex && nearestAfter == null) {
+                nearestAfter = field;
+            }
+        }
+        return nearestAfter != null ? nearestAfter : nearest;
+    }
+
+    private static List<Field> instanceFields(Class<?> owner) {
+        ArrayList<Field> fields = new ArrayList<>();
+        Class<?> type = owner;
+        while (type != null && type != Object.class) {
+            for (Field field : type.getDeclaredFields()) {
+                if (Modifier.isStatic(field.getModifiers())) {
+                    continue;
+                }
+                try {
+                    field.setAccessible(true);
+                    fields.add(field);
+                } catch (Throwable ignored) {
+                }
+            }
+            type = type.getSuperclass();
+        }
+        return fields;
+    }
+
     private static boolean isResidentBridgeRequest(Object value) {
         if (!(value instanceof Bundle)) {
             return false;
@@ -1200,40 +1911,354 @@ public final class GlanceObserver extends XposedModule {
 
     private static ResidentState inspectResidentState(Iterable<?> residents) {
         ResidentState state = new ResidentState();
-        for (Object resident : residents) {
-            state.size++;
-            try {
-                Object displayInfo = readField(resident, "a");
-                Object typeValue = readField(displayInfo, "d");
-                if (!(typeValue instanceof Integer)
-                        || ((Integer) typeValue) != SYNTHETIC_TYPE) {
+        if (residents instanceof Collection<?>) {
+            state.size = ((Collection<?>) residents).size();
+        }
+        int inspected = 0;
+        try {
+            for (Object resident : residents) {
+                if (inspected >= MAX_RESIDENT_SCAN) {
+                    state.malformed++;
+                    break;
+                }
+                inspected++;
+                if (!(residents instanceof Collection<?>)) {
+                    state.size++;
+                }
+                DisplayInfoSnapshot displayInfo = findDisplayInfo(resident);
+                if (displayInfo == null || displayInfo.type == null) {
+                    state.malformed++;
+                    continue;
+                }
+                state.recognized++;
+                if (displayInfo.type != SYNTHETIC_TYPE) {
                     continue;
                 }
                 state.controlType++;
-                Object providerValue = readField(displayInfo, "m");
-                if (providerValue == null) {
-                    state.nullProvider++;
-                } else if (providerValue instanceof ComponentName) {
-                    state.componentProvider++;
-                } else {
+                if (!displayInfo.providerKnown) {
                     state.malformed++;
+                    continue;
                 }
-            } catch (Throwable ignored) {
-                state.malformed++;
+                if (displayInfo.provider == null) {
+                    state.nullProvider++;
+                } else {
+                    state.componentProvider++;
+                }
             }
+        } catch (Throwable ignored) {
+            state.malformed++;
         }
         return state;
     }
 
+    private static DisplayInfoSnapshot findDisplayInfo(Object resident) {
+        if (resident == null) {
+            return null;
+        }
+        DisplayInfoSnapshot direct = inspectDisplayInfo(resident);
+        if (direct != null) {
+            return direct;
+        }
+        DisplayInfoSnapshot best = null;
+        for (Field field : instanceFields(resident.getClass())) {
+            Class<?> fieldType = field.getType();
+            if (fieldType.isPrimitive()
+                    || fieldType.isEnum()
+                    || fieldType == String.class
+                    || Number.class.isAssignableFrom(fieldType)
+                    || fieldType == Boolean.class
+                    || fieldType == Character.class) {
+                continue;
+            }
+            try {
+                Object candidate = field.get(resident);
+                if (candidate == null) {
+                    continue;
+                }
+                DisplayInfoSnapshot inspected = inspectDisplayInfo(candidate);
+                if (inspected != null
+                        && (best == null || inspected.confidence > best.confidence)) {
+                    best = inspected;
+                }
+            } catch (Throwable ignored) {
+            }
+        }
+        return best;
+    }
+
+    private static DisplayInfoSnapshot inspectDisplayInfo(Object candidate) {
+        Class<?> type = candidate.getClass();
+        int confidence = displayInfoConfidence(type);
+        if (confidence == 0) {
+            return null;
+        }
+
+        Integer cardType = null;
+        Method typeGetter = findNoArgMethod(type, "getType");
+        if (typeGetter != null) {
+            try {
+                Object value = typeGetter.invoke(candidate);
+                if (value instanceof Integer) {
+                    cardType = (Integer) value;
+                }
+            } catch (Throwable ignored) {
+            }
+        }
+        if (cardType == null) {
+            cardType = findSyntheticTypeValue(candidate);
+        }
+        if (cardType == null) {
+            cardType = findTypeValueFromText(candidate);
+        }
+
+        boolean providerKnown = false;
+        ComponentName provider = null;
+        Method providerGetter = findNoArgMethod(type, "getWidgetProvider");
+        if (providerGetter == null) {
+            providerGetter = findComponentNameGetter(type);
+        }
+        if (providerGetter != null) {
+            try {
+                Object value = providerGetter.invoke(candidate);
+                if (value == null || value instanceof ComponentName) {
+                    providerKnown = true;
+                    provider = (ComponentName) value;
+                }
+            } catch (Throwable ignored) {
+            }
+        }
+        if (!providerKnown) {
+            for (Field field : instanceFields(type)) {
+                if (!ComponentName.class.isAssignableFrom(field.getType())) {
+                    continue;
+                }
+                try {
+                    Object value = field.get(candidate);
+                    if (value == null || value instanceof ComponentName) {
+                        providerKnown = true;
+                        provider = (ComponentName) value;
+                        break;
+                    }
+                } catch (Throwable ignored) {
+                }
+            }
+        }
+        return cardType != null || providerKnown
+                ? new DisplayInfoSnapshot(cardType, provider, providerKnown, confidence)
+                : null;
+    }
+
+    private static int displayInfoConfidence(Class<?> type) {
+        boolean namedCardDisplayInfo = type.getName().endsWith(".CardDisplayInfo");
+        int confidence = namedCardDisplayInfo ? 100 : 0;
+        Method typeGetter = findNoArgMethod(type, "getType");
+        boolean hasTypeGetter = typeGetter != null
+                && (typeGetter.getReturnType() == int.class
+                || typeGetter.getReturnType() == Integer.class);
+        if (hasTypeGetter) {
+            confidence += 40;
+        }
+        Method providerGetter = findNoArgMethod(type, "getWidgetProvider");
+        boolean hasProviderShape = false;
+        if (providerGetter != null
+                && ComponentName.class.isAssignableFrom(providerGetter.getReturnType())) {
+            confidence += 40;
+            hasProviderShape = true;
+        } else if (findComponentNameGetter(type) != null) {
+            confidence += 20;
+            hasProviderShape = true;
+        } else if (hasComponentNameField(type)) {
+            confidence += 20;
+            hasProviderShape = true;
+        }
+        int integerGetterCount = 0;
+        for (Method method : type.getMethods()) {
+            Class<?> returnType = method.getReturnType();
+            if (method.getParameterTypes().length == 0
+                    && (returnType == int.class || returnType == Integer.class)) {
+                integerGetterCount++;
+            }
+        }
+        if (integerGetterCount >= 4) {
+            confidence += 10;
+        }
+        return namedCardDisplayInfo || (hasTypeGetter && hasProviderShape) ? confidence : 0;
+    }
+
+    private static boolean hasComponentNameField(Class<?> owner) {
+        for (Field field : instanceFields(owner)) {
+            if (ComponentName.class.isAssignableFrom(field.getType())) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static Integer findSyntheticTypeValue(Object candidate) {
+        for (Field field : instanceFields(candidate.getClass())) {
+            Class<?> fieldType = field.getType();
+            if (fieldType != int.class && fieldType != Integer.class) {
+                continue;
+            }
+            try {
+                Object value = field.get(candidate);
+                if (value instanceof Integer && ((Integer) value) == SYNTHETIC_TYPE) {
+                    return (Integer) value;
+                }
+            } catch (Throwable ignored) {
+            }
+        }
+        return null;
+    }
+
+    private static Integer findTypeValueFromText(Object candidate) {
+        try {
+            String text = String.valueOf(candidate);
+            int marker = text.indexOf("type=");
+            if (marker < 0) {
+                return null;
+            }
+            int start = marker + "type=".length();
+            int end = start;
+            while (end < text.length()) {
+                char character = text.charAt(end);
+                if (character == ',' || character == ')' || Character.isWhitespace(character)) {
+                    break;
+                }
+                end++;
+            }
+            return Integer.valueOf(text.substring(start, end));
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+
+    private static Method findNoArgMethod(Class<?> owner, String methodName) {
+        try {
+            Method method = owner.getMethod(methodName);
+            if (method.getParameterTypes().length != 0) {
+                return null;
+            }
+            method.setAccessible(true);
+            return method;
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+
+    private static Method findComponentNameGetter(Class<?> owner) {
+        for (Method method : owner.getMethods()) {
+            if (method.getParameterTypes().length == 0
+                    && ComponentName.class.isAssignableFrom(method.getReturnType())) {
+                try {
+                    method.setAccessible(true);
+                    return method;
+                } catch (Throwable ignored) {
+                    return null;
+                }
+            }
+        }
+        return null;
+    }
+
     private static final class ResidentState {
         int size;
+        int recognized;
         int controlType;
         int nullProvider;
         int componentProvider;
         int malformed;
     }
 
-    private static Object addResidentBridgeState(Object original, Object service) {
+    private static final class ResidentSnapshot {
+        final boolean known;
+        final boolean ready;
+        final ResidentState state;
+        final String layoutSummary;
+
+        ResidentSnapshot(
+                boolean known,
+                boolean ready,
+                ResidentState state,
+                String layoutSummary) {
+            this.known = known;
+            this.ready = ready;
+            this.state = state;
+            this.layoutSummary = layoutSummary;
+        }
+
+        static ResidentSnapshot unknown() {
+            return new ResidentSnapshot(false, false, new ResidentState(), "unknown");
+        }
+    }
+
+    private static final class ResidentFieldCandidate {
+        final Field field;
+        final int fieldIndex;
+        final ResidentState state;
+        final int score;
+
+        ResidentFieldCandidate(Field field, int fieldIndex, ResidentState state, int score) {
+            this.field = field;
+            this.fieldIndex = fieldIndex;
+            this.state = state;
+            this.score = score;
+        }
+    }
+
+    private static final class ResidentLayout {
+        final Class<?> serviceClass;
+        final Field residentField;
+        final Field readyField;
+
+        ResidentLayout(Class<?> serviceClass, Field residentField, Field readyField) {
+            this.serviceClass = serviceClass;
+            this.residentField = residentField;
+            this.readyField = readyField;
+        }
+
+        boolean matches(Object service) {
+            return service != null && serviceClass == service.getClass();
+        }
+
+        Boolean readReady(Object service) {
+            if (readyField == null) {
+                return null;
+            }
+            try {
+                Object value = readyField.get(service);
+                return value instanceof Boolean ? (Boolean) value : null;
+            } catch (Throwable ignored) {
+                return null;
+            }
+        }
+
+        String summary() {
+            return "service=" + serviceClass.getName()
+                    + ", residents=" + residentField.getName()
+                    + ", ready=" + (readyField == null ? "inferred" : readyField.getName());
+        }
+    }
+
+    private static final class DisplayInfoSnapshot {
+        final Integer type;
+        final ComponentName provider;
+        final boolean providerKnown;
+        final int confidence;
+
+        DisplayInfoSnapshot(
+                Integer type,
+                ComponentName provider,
+                boolean providerKnown,
+                int confidence) {
+            this.type = type;
+            this.provider = provider;
+            this.providerKnown = providerKnown;
+            this.confidence = confidence;
+        }
+    }
+
+    private Object addResidentBridgeState(Object original, Object service) {
         Bundle response = original instanceof Bundle
                 ? new Bundle((Bundle) original)
                 : new Bundle();
@@ -1243,25 +2268,19 @@ public final class GlanceObserver extends XposedModule {
             response.putBoolean(BRIDGE_KNOWN_KEY, false);
             return response;
         }
-        try {
-            Object readyValue = readField(service, "j");
-            Object residentValue = readField(service, "g");
-            if (!(readyValue instanceof Boolean) || !(residentValue instanceof Iterable<?>)) {
-                response.putBoolean(BRIDGE_KNOWN_KEY, false);
-                return response;
-            }
-
-            ResidentState state = inspectResidentState((Iterable<?>) residentValue);
-            response.putBoolean(BRIDGE_KNOWN_KEY, true);
-            response.putBoolean(BRIDGE_READY_KEY, (Boolean) readyValue);
-            response.putInt(BRIDGE_SIZE_KEY, state.size);
-            response.putInt(BRIDGE_CONTROL_TYPE_KEY, state.controlType);
-            response.putInt(BRIDGE_NULL_PROVIDER_KEY, state.nullProvider);
-            response.putInt(BRIDGE_COMPONENT_PROVIDER_KEY, state.componentProvider);
-            response.putInt(BRIDGE_MALFORMED_KEY, state.malformed);
-        } catch (Throwable ignored) {
+        ResidentSnapshot snapshot = readResidentSnapshot(service);
+        if (!snapshot.known) {
             response.putBoolean(BRIDGE_KNOWN_KEY, false);
+            return response;
         }
+        ResidentState state = snapshot.state;
+        response.putBoolean(BRIDGE_KNOWN_KEY, true);
+        response.putBoolean(BRIDGE_READY_KEY, snapshot.ready);
+        response.putInt(BRIDGE_SIZE_KEY, state.size);
+        response.putInt(BRIDGE_CONTROL_TYPE_KEY, state.controlType);
+        response.putInt(BRIDGE_NULL_PROVIDER_KEY, state.nullProvider);
+        response.putInt(BRIDGE_COMPONENT_PROVIDER_KEY, state.componentProvider);
+        response.putInt(BRIDGE_MALFORMED_KEY, state.malformed);
         return response;
     }
 
@@ -1342,9 +2361,17 @@ public final class GlanceObserver extends XposedModule {
         if (owner == null) {
             throw new IllegalArgumentException("owner is null");
         }
-        Method method = owner.getClass().getMethod(methodName);
-        method.setAccessible(true);
-        return method.invoke(owner);
+        Class<?> type = owner.getClass();
+        while (type != null && type != Object.class) {
+            try {
+                Method method = type.getDeclaredMethod(methodName);
+                method.setAccessible(true);
+                return method.invoke(owner);
+            } catch (NoSuchMethodException ignored) {
+                type = type.getSuperclass();
+            }
+        }
+        throw new NoSuchMethodException(owner.getClass().getName() + '#' + methodName);
     }
 
     private static Object invokeStaticNoArgSafely(String className, String methodName) {
