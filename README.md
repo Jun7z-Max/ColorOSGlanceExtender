@@ -107,14 +107,14 @@ APK 输出到 `app/build/outputs/apk/debug/app-debug.apk`。
 
 ## Codex Skill
 
-仓库内置项目专用 Skill：`skills/coloros-glance-extender/`。需要在 Codex 中复用时，将该目录复制到本机 Skill 目录：
+仓库内置通用 Skill：`skills/magisk-module-development/`。需要在 Codex 中复用时，将该目录复制到本机 Skill 目录：
 
 ```bash
 mkdir -p "${CODEX_HOME:-$HOME/.codex}/skills"
-cp -R skills/coloros-glance-extender "${CODEX_HOME:-$HOME/.codex}/skills/"
+cp -R skills/magisk-module-development "${CODEX_HOME:-$HOME/.codex}/skills/"
 ```
 
-该 Skill 包含模块注入边界、动态卡片目录、UI 主题、ADB 验证和 GitHub Release 流程，不包含任何签名密钥或设备私有数据。
+该 Skill 用于 Magisk 模块的开发、检查、构建、打包和 ADB 真机验证，不包含任何签名密钥或设备私有数据。
 
 
 ## 免责声明

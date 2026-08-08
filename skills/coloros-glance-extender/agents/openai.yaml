@@ -1,4 +1,0 @@
-interface:
-  display_name: "ColorOS Glance Extender"
-  short_description: "Maintain and release the ColorOS glance module"
-  default_prompt: "Use $coloros-glance-extender to modify, validate, or release this ColorOS LSPosed module."
