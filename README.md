@@ -105,6 +105,17 @@ Provider 只接受严格校验后的包名，只支持读取 PNG，不支持新�
 
 APK 输出到 `app/build/outputs/apk/debug/app-debug.apk`。
 
+## Codex Skill
+
+仓库内置项目专用 Skill：`skills/coloros-glance-extender/`。需要在 Codex 中复用时，将该目录复制到本机 Skill 目录：
+
+```bash
+mkdir -p "${CODEX_HOME:-$HOME/.codex}/skills"
+cp -R skills/coloros-glance-extender "${CODEX_HOME:-$HOME/.codex}/skills/"
+```
+
+该 Skill 包含模块注入边界、动态卡片目录、UI 主题、ADB 验证和 GitHub Release 流程，不包含任何签名密钥或设备私有数据。
+
 
 ## 免责声明
 
